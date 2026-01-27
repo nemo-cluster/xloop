@@ -6,6 +6,8 @@
 
 #if RHEL_CHECK_VERSION(RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(10, 1))
 #include "xloop_main_6.14.c" // Make a copy once this diverges!
+#elif RHEL_CHECK_VERSION(RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 7))
+#include "xloop_main_6.14.c"
 #elif RHEL_CHECK_VERSION(RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 6))
 #include "xloop_main_6.11.c"
 #elif RHEL_CHECK_VERSION(RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 0))

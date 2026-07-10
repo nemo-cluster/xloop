@@ -977,6 +977,10 @@ static ssize_t __qcow_file_fmt_buffer_decompress(struct xloop_file_fmt *xlo_fmt,
  * using the compression method defined by the image
  * compression type and write them to @bvec
  *
+ * IMPORTANT: This function must be called WITHOUT holding qcow_data->global_mutex.
+ * It performs blocking kernel_read() operations and handles its own cache coherence
+ * by briefly acquiring the mutex only for cache state checks and updates.
+ *
  * @xlo_fmt - QCOW file format
  * @bvec - io vector to write uncompressed data to
  * @file_cluster_offset - offset to compressed cluster in qcow2
@@ -997,69 +1001,108 @@ static int __qcow_file_fmt_read_compressed(struct xloop_file_fmt *xlo_fmt, struc
 	u8 *in_buf = NULL;
 	ssize_t len;
 	void *data;
+	int csize, nb_csectors;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0) && !RHEL_CHECK_VERSION(RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 0))
 	unsigned long irq_flags;
 #endif
-	int offset_in_cluster = xloop_file_fmt_qcow_offset_into_cluster(qcow_data, offset);
+	int offset_in_cluster;
+	loff_t read_offset;
 
+	ASSERT(bytes <= bvec->bv_len);
+
+	mutex_lock(&qcow_data->global_mutex);
+	offset_in_cluster = xloop_file_fmt_qcow_offset_into_cluster(qcow_data, offset);
 	coffset = file_cluster_offset & qcow_data->cluster_offset_mask;
+	nb_csectors = ((file_cluster_offset >> qcow_data->csize_shift) & qcow_data->csize_mask) + 1;
+	csize = nb_csectors * QCOW_COMPRESSED_SECTOR_SIZE - (coffset & ~QCOW_COMPRESSED_SECTOR_MASK);
 
-	if (qcow_data->cmp_last_coffset != coffset) {
-		int csize, nb_csectors;
+	/*
+	 * Step 1: Check cache under mutex - brief hold
+	 */
+	if (qcow_data->cmp_last_coffset == coffset &&
+	    offset_in_cluster + bytes <= qcow_data->cmp_last_size) {
+		/* Cache hit - copy data and return */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0) || RHEL_CHECK_VERSION(RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 0))
+		data = bvec_kmap_local(bvec);
+#else
+		data = bvec_kmap_irq(bvec, &irq_flags);
+#endif
+		memcpy(data + bytes_done, qcow_data->cmp_out_buf + offset_in_cluster, bytes);
+		flush_dcache_page(bvec->bv_page);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0) || RHEL_CHECK_VERSION(RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 0))
+		kunmap_local(data);
+#else
+		bvec_kunmap_irq(data, &irq_flags);
+#endif
+		mutex_unlock(&qcow_data->global_mutex);
+		return bytes;
+	}
+	mutex_unlock(&qcow_data->global_mutex);
 
-		dev_dbg(xloop_file_fmt_to_dev(xlo_fmt), "caching cluster at %llu\n", coffset);
-		nb_csectors = ((file_cluster_offset >> qcow_data->csize_shift) & qcow_data->csize_mask) + 1;
-		csize = nb_csectors * QCOW_COMPRESSED_SECTOR_SIZE - (coffset & ~QCOW_COMPRESSED_SECTOR_MASK);
-		in_buf = vmalloc(csize);
-		if (!in_buf) {
-			qcow_data->cmp_last_coffset = ULLONG_MAX;
-			return -ENOMEM;
-		}
-		qcow_data->cmp_last_coffset = coffset;
-		len = kernel_read(xlo->xlo_backing_file, in_buf, csize, &coffset);
-		if (len < 0) {
-			qcow_data->cmp_last_coffset = ULLONG_MAX;
-			dev_err(xloop_file_fmt_to_dev(xlo_fmt), "error %d reading compressed cluster at %llu\n",
-					(int)len, coffset);
-			ret = len;
-			goto out_free_in_buf;
-		}
-		if (len != csize) {
-			qcow_data->cmp_last_coffset = ULLONG_MAX;
-			dev_err(xloop_file_fmt_to_dev(xlo_fmt), "short read in compressed cluster at %llu (%d/%d)\n",
-					coffset, (int)len, csize);
-			ret = -EIO;
-			goto out_free_in_buf;
-		}
-
-		ret = __qcow_file_fmt_buffer_decompress(xlo_fmt, qcow_data->cmp_out_buf,
-				qcow_data->cluster_size, in_buf, csize);
-		if (ret <= 0) {
-			qcow_data->cmp_last_coffset = ULLONG_MAX;
-			if (ret == 0) {
-				dev_err(xloop_file_fmt_to_dev(xlo_fmt), "decompressed cluster at %llu is empty\n",
-					coffset);
-				ret = -EIO;
-			}
-			goto out_free_in_buf;
-		}
-		qcow_data->cmp_last_size = ret;
+	/*
+	 * Step 2: Cache miss - allocate buffer and read from backing file
+	 * NO mutex held during blocking I/O
+	 */
+	dev_dbg(xloop_file_fmt_to_dev(xlo_fmt), "caching cluster at %llu\n", coffset);
+	in_buf = vmalloc(csize);
+	if (!in_buf) {
+		return -ENOMEM;
 	}
 
+	read_offset = coffset;
+	len = kernel_read(xlo->xlo_backing_file, in_buf, csize, &read_offset);
+	if (len < 0) {
+		dev_err(xloop_file_fmt_to_dev(xlo_fmt), "error %d reading compressed cluster at %llu\n",
+				(int)len, coffset);
+		ret = len;
+		goto out_free_in_buf;
+	}
+	if (len != csize) {
+		dev_err(xloop_file_fmt_to_dev(xlo_fmt), "short read in compressed cluster at %llu (%d/%d)\n",
+				coffset, (int)len, csize);
+		ret = -EIO;
+		goto out_free_in_buf;
+	}
+
+	/*
+	 * Step 3: Decompress (CPU-bound, no blocking)
+	 */
+	mutex_lock(&qcow_data->global_mutex);
+	ret = __qcow_file_fmt_buffer_decompress(xlo_fmt, qcow_data->cmp_out_buf,
+			qcow_data->cluster_size, in_buf, csize);
+	if (ret <= 0) {
+		qcow_data->cmp_last_coffset = ULLONG_MAX;
+		if (ret == 0) {
+			dev_err(xloop_file_fmt_to_dev(xlo_fmt), "decompressed cluster at %llu is empty\n",
+				coffset);
+			ret = -EIO;
+		}
+		goto out_free_in_buf;
+	}
+
+	/*
+	 * Step 4: Update cache state and fill kernel buffers under mutex
+	 */
+	qcow_data->cmp_last_coffset = coffset;
+	qcow_data->cmp_last_size = ret;
+
+	/* Double-check the read is still valid for this request */
 	if (offset_in_cluster + bytes > qcow_data->cmp_last_size) {
+		mutex_unlock(&qcow_data->global_mutex);
 		dev_err(xloop_file_fmt_to_dev(xlo_fmt), "read %d bytes from compressed cluster of size %d\n",
 			(int)(offset_in_cluster + bytes), qcow_data->cmp_last_size);
 		ret = -EIO;
 		goto out_free_in_buf;
 	}
 
-	ASSERT(bytes <= bvec->bv_len);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0) || RHEL_CHECK_VERSION(RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 0))
 	data = bvec_kmap_local(bvec);
 #else
 	data = bvec_kmap_irq(bvec, &irq_flags);
 #endif
 	memcpy(data + bytes_done, qcow_data->cmp_out_buf + offset_in_cluster, bytes);
+	mutex_unlock(&qcow_data->global_mutex);
+
 	flush_dcache_page(bvec->bv_page);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0) || RHEL_CHECK_VERSION(RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 0))
 	kunmap_local(data);
@@ -1125,9 +1168,14 @@ static int __qcow_file_fmt_read_bvec(struct xloop_file_fmt *xlo_fmt, struct bio_
 			break;
 
 		case QCOW_SUBCLUSTER_COMPRESSED:
-			mutex_lock(&qcow_data->global_mutex);
+			/*
+			 * IMPORTANT: Do NOT hold mutex here - __qcow_file_fmt_read_compressed
+			 * performs blocking kernel_read() operations and must not block
+			 * other workers from accessing the L2 cache.
+			 * The compressed read function handles its own cache coherence
+			 * with brief mutex acquisition only for cache state checks/updates.
+			 */
 			ret = __qcow_file_fmt_read_compressed(xlo_fmt, bvec, host_offset, *ppos, cur_bytes, bytes_done);
-			mutex_unlock(&qcow_data->global_mutex);
 			if (ret < 0)
 				goto fail;
 			if (ret == 0) {
